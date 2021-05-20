@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/ardanlabs/conf"
 	"github.com/pkg/errors"
+	"github.com/stevejxn/learn-go-webapi/app/products-api/handlers"
 )
 
 const (
@@ -17,10 +23,10 @@ const (
 var build = "develop"
 
 func main() {
-	log := log.New(os.Stdout, "PRODUCTS : ", log.LstdFlags|log.Lmicroseconds|log.Lshortfile)
+	logger := log.New(os.Stdout, "PRODUCTS : ", log.LstdFlags|log.Lmicroseconds|log.Lshortfile)
 
-	if err := run(log); err != nil {
-		log.Println("main: error:", err)
+	if err := run(logger); err != nil {
+		logger.Println("main: error:", err)
 		os.Exit(1)
 	}
 }
@@ -32,10 +38,10 @@ func run(log *log.Logger) error {
 	var cfg struct {
 		conf.Version
 		Web struct {
-			APIHost         string `conf:"default:0.0.0.0:3000"`
-			ReadTimeout     string `conf:"default:5s"`
-			WriteTimeout    string `conf:"default:5s"`
-			ShutdownTimeout string `conf:"default:5s"`
+			APIHost         string        `conf:"default:0.0.0.0:3000"`
+			ReadTimeout     time.Duration `conf:"default:5s"`
+			WriteTimeout    time.Duration `conf:"default:5s"`
+			ShutdownTimeout time.Duration `conf:"default:5s"`
 		}
 	}
 	cfg.SVN = build
@@ -59,6 +65,66 @@ func run(log *log.Logger) error {
 			return nil
 		}
 		return errors.Wrap(err, "parsing config")
+	}
+
+	// ===
+	// App Starting
+	log.Printf("main: Started: Application initializing: version %q", build)
+	defer log.Println("main: Completed")
+
+	configDetails, err := conf.String(&cfg)
+	if err != nil {
+		return errors.Wrap(err, "generating config output for logging")
+	}
+	log.Printf("main: Config:\n%v\n", configDetails)
+
+	// TODO: init auth, database, tracing, debug support
+
+	// ===
+	// Start API Service
+	log.Println("main: Initializing API service")
+
+	// Make a channel to listen for an interrupt or terminate signal from the OS.
+	// A buffered channel is required by the signal package
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	api := http.Server{
+		Addr:         cfg.Web.APIHost,
+		Handler:      handlers.API(build, shutdown, log),
+		ReadTimeout:  cfg.Web.ReadTimeout,
+		WriteTimeout: cfg.Web.WriteTimeout,
+	}
+
+	// Make a channel to receive for errors coming from the listener.
+	// Use a buffered channel so allow the goroutine to exit if the error is never collected
+	serverErrors := make(chan error, 1)
+
+	// Start the service listening for requests
+	go func() {
+		log.Printf("main: API listening on %s", api.Addr)
+		serverErrors <- api.ListenAndServe()
+	}()
+
+	// ===
+	// Shutdown
+	select {
+	case err := <-serverErrors:
+		return errors.Wrap(err, "server error")
+	case sig := <-shutdown:
+		log.Printf("main: %v: Start shutdown", sig)
+
+		// Give any outstanding requests a deadline for completion
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.Web.ShutdownTimeout)
+		defer cancel()
+
+		// Asking listener to shutdown and shed load.
+		if err := api.Shutdown(ctx); err != nil {
+			_ = api.Close()
+			return errors.Wrap(err, "could not stop the server gracefully")
+		}
+
+		log.Printf("main: %v: Completed shutdown", sig)
 	}
 
 	return nil

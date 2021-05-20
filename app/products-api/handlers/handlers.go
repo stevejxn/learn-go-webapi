@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"github.com/dimfeld/httptreemux/v5"
 	"net/http"
 )
 
 func API() http.Handler {
-	api := http.NewServeMux()
-	api.HandleFunc("/status/ping", statusPingHandler)
-	return api
+	router := httptreemux.NewContextMux()
+	group := router.NewGroup("/api")
+	group.GET("/status/ping", statusPingHandler)
+	return router
 }
